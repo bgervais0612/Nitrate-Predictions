@@ -1,0 +1,482 @@
+---
+title: "Water Quality Predictions"
+author: "Bridget Gervais"
+date: "2026-06-25"
+output: html_document
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+Welcome to this page on Machine learning predictions of water quality. Nitrate is an incredibly important issue, especially in agriculturally driven states. Excess fertilizer from the soil runs off into waterways and causes health issues, thus predicting high nitrates can help offset treatment costs and reduce future runoff. 
+
+The below map allows you to click on a site and on the right, a plot of the 4-year monthly nitrate trend will appear. Each color denotes a region that was used to subset the data into hydrologically similar sites. The regions are: 
+
+- Mississippi Plain (MSP)
+- Iowa Surface (IS)
+- Des Moines Lobe (DML)
+- Northwest Iowa Plain (NWIP)
+- Missouri Plain (MOP)
+- Southern Iowa Drift Plain (SIDP)
+
+Feel free to explore!! 
+
+```{r data preparation, echo=FALSE, warning = FALSE, message=FALSE}
+library(shiny)
+library(bslib)
+library(ggmap)
+library(ggplot2)
+library(plotly)
+library(dplyr)
+library(tidyr)
+library(DT)
+library(leaflet)
+library(MLmetrics)
+library(e1071)
+
+setwd("C:/Users/Bridget/Documents/Indiana_University/Spring _26/Senior Thesis/Journal Article Submission and Code")
+nitrate <- read.csv("data.csv")
+
+#assign region order
+nitrate$Region <- factor(nitrate$Region, 
+                         levels=c("NWIP","DML","MSP","MOP", "SIDP","IS"))
+
+regions <- levels(nitrate$Region)
+
+nitrate <- drop_na(nitrate)
+
+nitrate$Warning_level <- factor(nitrate$Warning_level, 
+                                levels = c("Safe","Warning","Alert"))
+
+nitrate$Future_Warning <- factor(nitrate$Future_Warning, 
+                                 levels = c("Safe","Warning","Alert"))
+
+nitrate$MonthLabel <- factor(
+  nitrate$Month,
+  levels = 1:12,
+  labels = month.abb
+)
+```
+
+```{r, echo=FALSE}
+# Color palette
+pal <- colorFactor(
+  palette = c("red","blue","green","gold","purple","magenta"),
+  domain = levels(nitrate$Region)
+)
+
+#create page dimensions and items
+ui <- fluidPage(
+  titlePanel("Nitrate Warning - December 2025"),
+  fluidRow(
+    column(6,
+        leafletOutput("map", height = "300px")),
+
+    column(6,
+        h3(textOutput("siteName")),
+        plotlyOutput("trend", height = "300px"))))
+```
+
+```{r, echo=FALSE}
+server <- function(input, output, session){
+  #output map
+output$map <- renderLeaflet({
+  leaflet(nitrate) %>%
+    addProviderTiles(providers$CartoDB.Positron) %>%
+    setView(lng = -93.5,
+            lat = 42.1,
+            zoom = 6) %>%
+    addCircleMarkers(lng = ~longitude.x,
+                     lat = ~latitude.x,
+                     layerId = ~Water_site,
+                     color = ~pal(Region),
+                     radius = 5,
+                     stroke = TRUE,
+                     fillOpacity = .85,
+                     popup = ~paste("<b>", Water_site, "</b><br>",
+                   "Region: ", Region))
+
+})
+
+#define selected site by click linking to layerID data
+selectedSite <- reactive({
+  req(input$map_marker_click)
+  input$map_marker_click$id
+})
+
+#output text for selected site
+output$site <- renderText({
+  selectedSite()
+})
+
+#create trend object
+output$trend <- renderPlotly({
+  site_data <- nitrate %>%
+    filter(Water_site == selectedSite())
+  
+  #x is month, y is nitrate, written in html
+  plot_ly(site_data,
+          x = ~MonthLabel,
+          y = ~Avg_Nitrate,
+          color = ~factor(Year),
+          colors = "Dark2",
+          type = "scatter",
+          mode = "lines+markers",
+          hovertemplate = paste("<b>Year %{fullData.name}</b><br>",
+                                "%{x}<br>",
+                                "Nitrate: %{y:.2f}<extra></extra>")) %>%
+    
+    layout(title = "Monthly Nitrate",
+           xaxis = list(title = "Month"),
+           yaxis = list(title = "Average Nitrate"))
+})
+}
+
+shinyApp(ui, server)
+
+```
+
+## ML Model Overview
+
+Models used include polynomial regression and support vector regression, using temperature and monthly rainfall as predictors, and nitrate change as the response. 
+
+Check the box next to the region you want to view
+
+```{r train-test, echo=FALSE}
+#create train/test splitting function
+define_train_test <- function(){
+  train <- list()
+  test <- list()
+  
+  #assign train and test set based on year
+  for (i in 1:6){
+    train[[i]] <- nitrate[nitrate$Year != 2025 & nitrate$Region == regions[i],]
+    
+    test[[i]] <- nitrate[nitrate$Year == 2025 & nitrate$Region == regions[i],]
+  }
+  return (list(train,test))
+}
+
+#create train and test variables
+train_test <- define_train_test()
+train <- train_test[[1]]
+test <- train_test[[2]]
+
+svm_params <- data.frame(sigma = c(.1, .1, .01, .1, .1, 1),
+                         C = c(10, 10, 100, 10, 10, 1))
+
+lm_models <- list()
+svm_models <- list()
+lm_predicted_change <- list()
+svm_predicted_change <- list()
+
+#train polynomial model via bootstrap
+for (i in 1:6){
+  set.seed(35791)
+  lm_models[[i]] <- lm(Change~0+poly(Monthly_Rainfall,degree=2)+
+                         poly(Avg_temp, degree=2), data = train[[i]])
+
+  lm_predicted_change[[i]] <- predict(lm_models[[i]], test[[i]])
+}
+
+for (i in 1:6){
+  set.seed(35791)
+  svm_models[[i]] <- svm(Change ~ 0+Monthly_Rainfall+Avg_temp, 
+                        data = train[[i]], 
+                        kernel = "radial",
+                        cost = svm_params$C[i],
+                        gamma = svm_params$sigma[i], 
+                        scale = TRUE,
+                        type = 'eps-regression')
+
+  svm_predicted_change[[i]] <- predict(svm_models[[i]], test[[i]])
+}
+
+#---Evaluate Model Performance
+get_evaluators <- function(model, predicted_change){
+  pred_warning <- list() #predicted warning level (Safe, Warning, Alert)
+  predicted_outputs <- list() #expected nitrate concentration (mg/L) -- change + prev month
+  resids <- list() #residuals of expected - actual change
+  f1s <- list()
+  recalls <- list()
+  accuracy <- c()
+  
+  #iterate over each region
+  for (i in 1:6){
+    #Note: Remove nulls, which have been filtered to only be missing change variable, meaning
+    #a prediction would not be able to be compared to the row, thus not used for testing. 
+    #compute actual nitrate output
+    predicted_outputs[[i]] <- test[[i]]$Avg_Nitrate + predicted_change[[i]] 
+    
+    #convert to warning class --> some low instances ended up less than zero, thus defaulted to safe class with min as the lower endpoint
+    pred_warning[[i]] <- cut(predicted_outputs[[i]],breaks = c(-Inf,7.5,10,Inf), labels = c("Safe","Warning","Alert"),right = FALSE)
+    
+    #compute residuals
+    resids[[i]] <- test[[i]]$Change - predicted_change[[i]]
+    
+    #f1s
+    f1_low <- F1_Score(y_true = test[[i]]$Future_Warning, y_pred = pred_warning[[i]],
+                       positive = "Safe")
+    f1_med <- F1_Score(y_true = test[[i]]$Future_Warning, y_pred = pred_warning[[i]],
+                       positive = "Warning")
+    f1_high <- F1_Score(y_true = test[[i]]$Future_Warning, y_pred = pred_warning[[i]],
+                        positive = "Alert")
+    
+    #recalls
+    recall_low <- Recall(y_true = test[[i]]$Future_Warning, y_pred = pred_warning[[i]],
+                         positive = "Safe")
+    recall_med <- Recall(y_true = test[[i]]$Future_Warning, y_pred = pred_warning[[i]],
+                         positive = "Warning")
+    recall_high <- Recall(y_true = test[[i]]$Future_Warning, y_pred = pred_warning[[i]],
+                          positive = "Alert")
+    
+    #accuracy
+    accuracy[i] <- Accuracy(y_true = drop_na(test[[i]])$Future_Warning, y_pred = pred_warning[[i]])
+    
+    f1s[[i]] <- c(f1_low, f1_med, f1_high)
+    recalls[[i]] <- c(recall_low, recall_med, recall_high)
+    
+  }
+  return (list(f1s, recalls, accuracy, predicted_outputs, pred_warning, resids))
+}
+
+#initialize evaluators for linear model
+linear_evals <- get_evaluators(lm_models, lm_predicted_change)
+linear_f1s <- linear_evals[[1]]
+linear_recalls <- linear_evals[[2]]
+linear_accuracy <- linear_evals[[3]]
+linear_predicted <- linear_evals[[4]]
+linear_pred_warning <- linear_evals[[5]]
+linear_resids <- linear_evals[[6]]
+
+#initialize evaluators for SVM model
+svm_mod <- get_evaluators(svm_models, svm_predicted_change)
+svm_f1s <- svm_mod[[1]]
+svm_recalls <- svm_mod[[2]]
+svm_accuracy <- svm_mod[[3]]
+svm_predicted <- svm_mod[[4]]
+svm_pred_warning <- svm_mod[[5]]
+svm_residuals <- svm_mod[[6]]
+
+#fill in f1 nulls to 0 
+for (i in 1:6){
+  for (j in 1:3){
+    if (is.na(linear_f1s[[i]][j])){
+      linear_f1s[[i]][j] <- 0
+    }
+    if (is.na(svm_f1s[[i]][j])){
+      svm_f1s[[i]][j] <- 0
+    }
+    
+  }
+}
+
+```
+
+
+```{r, echo=FALSE}
+for (i in 1:6){
+  test[[i]]$Linear_Predicted <- linear_predicted[[i]]
+  test[[i]]$SVM_Predicted <- svm_predicted[[i]]
+}
+
+full_predictions <- rbind(test[[1]],test[[2]], test[[3]],test[[4]],test[[5]], test[[6]])
+
+full_predictions$Linear_Warning <- cut(full_predictions$Linear_Predicted,
+                                       breaks=c(-Inf,7.5,10,Inf),
+                                       labels = c("Safe","Warning","Alert"))
+
+full_predictions$SVM_Warning <- cut(full_predictions$SVM_Predicted,
+                                       breaks=c(-Inf,7.5,10,Inf),
+                                       labels = c("Safe","Warning","Alert"))
+
+ui2 <- fluidPage(
+  titlePanel("Regions"),
+  sidebarLayout(
+    sidebarPanel(
+      checkboxGroupInput(
+        inputId = "regions", 
+        label = "Select Region(s):",
+        choices = levels(full_predictions$Region), 
+        selected = levels(full_predictions$Region))),
+    mainPanel(
+      fluidRow(
+        column(6,plotlyOutput("modelPlotLM", height = "300px")),
+        column(6,plotlyOutput("modelPlotSVM", height = "300px")))
+      ), 
+  ), DTOutput("metricsTable"))
+
+server2 <- function(input, output, session){
+  selectedRegions <- reactive({
+    req(input$regions)
+    
+    full_predictions %>% filter(Region %in% input$regions)
+  })
+  
+  output$modelPlotLM <- renderPlotly({
+    region_data <- selectedRegions()
+    
+    plot_ly(region_data, 
+            x= ~Future_Nitrate, 
+            y= ~Linear_Predicted, 
+            type = "scatter",
+            mode = "markers", 
+            color = ~factor(Year),
+            colors = "Dark2",
+            text = ~paste("<b>",Water_site,"</b><br>",
+                          "Region: ", Region, "<br>",
+                          "Month: ", MonthLabel, "<br>",
+                          "Observed: ", Future_Nitrate, "mg/L <br>",
+                          "Predicted: ", round(Linear_Predicted, 2), "mg/L"),
+            hoverinfo = "text") %>%
+      
+      layout(title = "Model Predictions - Poly",
+             xaxis = list(title = "Observed Nitrate"),
+             yaxis = list(title = "Predicted Nitrate"), 
+             color = "black",
+             shapes = list(
+               list(type = "line",
+                    x0 = 0,
+                    x1 = 25,
+                    y0 = 0,
+                    y1 = 25,
+                    line = list(color = "blue", dash = "dash")),
+               list(type = "line",
+                    x0 = 0, 
+                    x1 = 30, 
+                    y0 = 10, 
+                    y1 = 10, 
+                    line = list(color = "red")),
+               list(type = "line",
+                    x0 = 0, 
+                    x1 = 30, 
+                    y0 = 7.5, 
+                    y1 = 7.5, 
+                    line = list(color = "gold"))), 
+             annotations = list(
+               list(x = 25, 
+                    y = 8.3, 
+                    text = "Warning", 
+                    showarrow = FALSE,
+                    font = list(size = 12)), 
+               list(x = 23.5, 
+                    y = 10.9, 
+                    text = "Alert",
+                    showarrow = FALSE, 
+                    font = list(size=12))))
+})
+  
+   output$modelPlotSVM <- renderPlotly({
+    region_data <- selectedRegions()
+    
+    plot_ly(region_data, 
+            x= ~Future_Nitrate, 
+            y= ~SVM_Predicted, 
+            type = "scatter",
+            mode = "markers", 
+            color = ~factor(Year),
+            colors = "Dark2",
+            text = ~paste("<b>",Water_site,"</b><br>",
+                          "Region: ", Region, "<br>",
+                          "Month: ", MonthLabel, "<br>",
+                          "Observed: ", Future_Nitrate, "mg/L <br>",
+                          "Predicted: ", round(SVM_Predicted, 2), "mg/L"),
+            hoverinfo = "text") %>%
+      
+      layout(title = "Model Predictions - SVM",
+             xaxis = list(title = "Observed Nitrate"),
+             yaxis = list(title = "Predicted Nitrate"), 
+             color = "black",
+             shapes = list(
+               list(type = "line",
+                    x0 = 0,
+                    x1 = 25,
+                    y0 = 0,
+                    y1 = 25,
+                    line = list(color = "blue", dash = "dash")),
+               list(type = "line",
+                    x0 = 0, 
+                    x1 = 30, 
+                    y0 = 10, 
+                    y1 = 10, 
+                    line = list(color = "red")),
+               list(type = "line",
+                    x0 = 0, 
+                    x1 = 30, 
+                    y0 = 7.5, 
+                    y1 = 7.5, 
+                    line = list(color = "gold"))), 
+             annotations = list(
+               list(x = 25, 
+                    y = 8.3, 
+                    text = "Warning", 
+                    showarrow = FALSE,
+                    font = list(size = 12)), 
+               list(x = 23.5, 
+                    y = 10.9, 
+                    text = "Alert",
+                    showarrow = FALSE, 
+                    font = list(size=12))))
+})
+  output$metricsTable <- renderDT({
+    region_info <- selectedRegions()
+    
+    linear_rmse <- round(sqrt(mean((region_info$Linear_Predicted - region_info$Future_Nitrate)^2)),3)
+    
+    svm_rmse <- round(sqrt(mean((region_info$SVM_Predicted - region_info$Future_Nitrate)^2)),3)
+    
+    linear_accuracy <- paste0(round(mean(region_info$Linear_Warning == region_info$Future_Warning),3)*100,"%")
+    
+    svm_accuracy <- paste0(round(mean(region_info$SVM_Warning == region_info$Future_Warning),3)*100,"%")
+    
+    f1s_linear <- c()
+    f1s_svm <- c()
+    warnings <- c("Safe","Warning", "Alert")
+    
+    for (i in 1:3){
+      f1s_linear[i] <- round(F1_Score(region_info$Future_Warning,
+                           region_info$Linear_Warning, 
+                           positive = as.character(
+                             levels(region_info$Linear_Warning)[i])),3)
+      
+      f1s_svm[i] <- round(F1_Score(region_info$Future_Warning,
+                          region_info$SVM_Warning,
+                          positive = as.character(
+                            levels(region_info$SVM_Warning)[i])),3)
+    }
+
+    
+    datatable(data.frame(Model = c("Linear","SVM"),
+                         RMSE = c(linear_rmse, svm_rmse),
+                         Accuracy = c(linear_accuracy, svm_accuracy),
+                         `F1 Safe` = c(f1s_linear[1], f1s_svm[1]),
+                         `F1 Warning` = c(f1s_linear[2], f1s_svm[2]),
+                         `F1 Alert` = c(f1s_linear[3], f1s_svm[3])), 
+              rownames = FALSE,
+              options = list(scrollY = "250px",
+                             scrollCollapse = TRUE,
+                             paging = FALSE))
+  })
+}
+
+
+shinyApp(ui2, server2)
+```
+
+## Results - Discussion
+
+The findings show how climate effects can be used to predict the expected change in nitrate concentration. The difficulty in predicting warnings is that the margin for the warning class is much smaller than the other classes. Any small deviation in the expected change, can put the new nitrate concentration into the wrong class. Likewise, the extremities between years added additional complexity to the model, making it unable to perform on the testing set. 
+
+F1 scores are naturally large for classes where the majority of observations belong. While F1 scores work well for imbalanced datasets, it is important to note that the model didn't do better at predicting the safe class, but rather there are a lot more instances predicted correctly, making the precision and recall used for F1 scores higher. 
+
+
+
+
+
+
+
+
