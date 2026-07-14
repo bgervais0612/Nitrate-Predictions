@@ -17,4 +17,5 @@ Data used includes the Ambient water testing data (available from the Iowa DNR) 
 - **Inter-year Differences**: 2025 and 2024 had more tests above the EPA threshold of 10 mg/L $NO_3  - N$.
 - **Seasonal Trends**: Nitrate concentration tended to peak in the late-spring/early-summer and leveled off by July/August.
 - **Model Performance**: Neither the Polynomial nor SVR models performed better than the other.
-- **Regional Performance**: Missouri river region had the highest F1 for the warning class. Larger waterways tended to have higher levels than smaller, regional waterways. 
+- **Regional Performance**: Missouri river region had the highest F1 for the warning class. Larger waterways tended to have higher levels than smaller, regional waterways.
+- **Future Improvements**: The data used only provided a monthly picture at nitrate levels. Monitoring on a more frequent interval will help to better understand the relationships between weather and nitrate fluctuations, in turn improving model accuracy. 
